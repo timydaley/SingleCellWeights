@@ -1,0 +1,447 @@
+---
+title: "Testing cell weighting by corrected dropout in scRNA-seq experiments"
+author: "Timothy Daley"
+date: "2/11/2019"
+output: html_document
+---
+
+[Van den Berge et al.](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-018-1406-4) recently showed that observation weights can facilitate application of standard RNA-seq differential expression tools such as DESeq and edgeR for single cell RNA-seq experiments.  Our objective here is to show that cell weighting by the estimated dropout proportion can also facilitate the application of differential expression tools to scRNA-seq experiments.  I'll first start off with a simulation.
+
+I will assume the following model.
+$$
+\begin{aligned}
+y_{ij} &= \text{count of gene } j \text{ in cell } i;
+\notag \\
+y_{ij} &\sim \pi_{ij} 1(0) + (1 - \pi_{ij}) \text{Pois}(\lambda_{ij});
+\notag \\
+\lambda_{ij} &\sim d*\phi_{ij}*\lambda_{0j}*\log \text{Normal} ( -0.5, 1^{2});
+\notag \\
+\phi_{ij} &= 5 \text{ for } 10\% \text{ of the genes in group 1 and } = 0.2 \text{ for } 10\% \text{ of the genes in group 1, and 0 otherwise};
+\notag \\
+\lambda_{0j} &\sim \text{Gamma}(\text{shape } = 0.1, \text{ rate } = 0.1);
+\notag \\
+\theta_{i} &\sim \log \text{Normal}(-2.5^{2}/2, 2.5^2 ).
+\notag \\
+d &= \text{ depth factor};
+\notag \\
+\pi_{ij} &= 1/(1 + \text{exp}(\log(1/\pi_{0j} - 1) + 0.5*(\phi_{i,j} - \bar{\phi})))
+\notag \\
+\pi_{0j} &\sim \text{Beta}(2, 4)
+\end{aligned}
+$$
+
+```{r}
+set.seed(1)
+n_cells = 1000
+cellLabels = factor(c(paste0("treatment", 1:(n_cells/2)), paste0("control", (n_cells/2 + 1):n_cells)))
+n_genes = 20000
+theta = exp(rnorm(n_cells, -(2.5^2)/2, 2.5))
+hist(theta, breaks = 50, col = "grey")
+lambda0 = rgamma(n_genes, shape = 0.1, rate = 0.1)
+hist(lambda0, breaks = 100, col = "grey")
+phi = matrix(1, nrow = n_genes, ncol = n_cells)
+dropout_baseline = rbeta(n_cells, 2, 4)
+hist(dropout_baseline, breaks = 100)
+dropout_baseline = -log(1/dropout_baseline - 1) # inverse of logistic function
+depth_factor = 0.05
+for(i in 1:(0.5*n_cells)){
+  for(j in 1:n_genes){
+    if(j <= 0.1*n_genes){
+      phi[j, i] = 5
+    }
+    if(j <= 0.2*n_genes & j > 0.1*n_genes){
+      phi[j, i] = 0.2
+    }
+  }
+}
+geneConditions = c(rep(1, times = 0.1*n_genes), 
+                   rep(-1, times = 0.1*n_genes), 
+                   rep(0, times = 0.8*n_genes))
+phibar = mean(phi)
+dropout_indicator = mat.or.vec(n_genes, n_cells)
+dropout_chance = mat.or.vec(n_genes, n_cells)
+for(i in 1:n_genes){
+  for(j in 1:n_cells){
+      dropout_chance[i,j] = 1/(1 + exp(-dropout_baseline[j] + (phi[i,j] - phibar)))
+      dropout_indicator[i,j] = rbinom(1, 1, dropout_chance[i,j])
+    }
+}
+
+hist(dropout_chance, breaks = 101)
+```
+
+```{r}
+counts = mat.or.vec(n_genes, n_cells)
+colnames(counts) = cellLabels
+rownames(counts) = paste0("gene", 1:n_genes)
+for(i in 1:n_cells){
+  for(j in 1:n_genes){
+    if(dropout_indicator[j, i] == 0){
+      #counts[j, i] = rnbinom(1, mu = depth_factor*phi[j, i]*lambda0[j]*theta[i], size = 0.1)
+      counts[j, i] = rpois(1, depth_factor*phi[j, i]*lambda0[j]*theta[i]*exp(rnorm(1, -0.5, sd = 1)))
+    }
+  }
+}
+hist(apply(counts, 2, sum), breaks = 100)
+hist(log(apply(counts, 2, sum)), breaks = 100)
+mean(apply(counts, 2, sum))
+max(counts)
+
+#dropout_chance.vs.logcounts = data.frame(dropout_chance = c(dropout_chance), logcounts = log(c(counts + 1)))
+#library(ggplot2)
+#ggplot(dropout_chance.vs.logcounts[sample.int(dim(dropout_chance.vs.logcounts)[1], dim(dropout_chance.vs.logcounts)[1]/10, replace = FALSE), ], aes(x = dropout_chance, y = logcounts)) + geom_point(alpha = 0.5) + stat_smooth()
+
+hist(apply(counts, 2, function(x) sum(x == 0)), breaks = 100)
+```
+
+```{r}
+cells2keep = which(colSums(counts) > 50)
+n_cells = length(cells2keep)
+n_cells
+genes2keep = intersect(which(rowSums(counts) > 10), which(rowSums((counts > 0)) > 3))
+geneConditions = geneConditions[genes2keep]
+n_genes = length(genes2keep)
+n_genes
+counts = counts[genes2keep, cells2keep]
+dim(counts)
+cellLabels = cellLabels[cells2keep]
+#counts = counts[ , cells2keep]
+dropout_indicator = dropout_indicator[genes2keep, cells2keep]
+#dropout_indicator = dropout_indicator[ , cells2keep]
+phi = phi[genes2keep, cells2keep]
+```
+
+```{r message=FALSE, warning=FALSE, results=FALSE}
+true_dropout = colSums(phi == 0 | dropout_indicator == 1)/n_genes
+hist(true_dropout, breaks = 100)
+observed_dropout = colSums((counts == 0))/n_genes
+library(ggplot2)
+d = data.frame(true_dropout = true_dropout, observed_dropout = observed_dropout)
+ggplot(d, aes(y = true_dropout, x = observed_dropout)) + geom_point(alpha = 0.8)
+cor(true_dropout, observed_dropout)
+
+preseq_estimated_dropout = rep(0, times = n_cells)
+chao_estimated_dropout = rep(0, times = n_cells)
+chaobunge_estimated_dropout = rep(0, times = n_cells)
+chaolee_estimated_dropout = rep(0, times = n_cells)
+#pnpmle_estimated_dropout = rep(0, times = n_cells)
+breakaway_estimated_dropout = rep(0, times = n_cells)
+jackknife_estimated_dropout = rep(0, times = n_cells)
+negbinom_estimated_dropout = rep(0, times = n_cells)
+lognorm_estimated_dropout = rep(0, times = n_cells)
+
+depth = rep(0, times = n_cells)
+library(SPECIES)
+library(breakaway)
+library(preseqR)
+neg_binom_species <- function(y_hist){
+  ztnb_fit = preseqR.ztnb.em(y_hist)
+  return(sum(y_hist[,2])*(1 + 1/(1 - (1 + ztnb_fit$mu/ztnb_fit$size)^(-ztnb_fit$size))))
+}
+lognorm_species <- function(y){
+  lognorm_fit = poilog::poilogMLE(y)
+  return(sum(y > 0)/(1 - poilog::dpoilog(0, mu = lognorm_fit$par["mu"], sig = lognorm_fit$par["sig"])))
+}
+for(i in 1:n_cells){
+	y = counts[,i]
+	y = y[(y > 0)]
+	y_unique = sort(unique(y), decreasing = FALSE)
+	y_hist = data.frame(j = y_unique, n_j = sapply(y_unique, function(x) length(which(y == x))))
+	write.table(y_hist, file = "y_hist.txt", sep = "\t", quote = FALSE, col.names = FALSE, row.names = FALSE)
+	if(dim(y_hist)[1] > 1){
+  	system("~/preseq/preseq bound_pop -H y_hist.txt -o preseq_estim.txt")
+  	preseq_estim = read.table(file = "preseq_estim.txt", header = TRUE)
+    preseq_estimated_dropout[i] = 1 - preseq_estim$median_estimated_unobs/n_genes
+    chao_estimated_dropout[i] = 1 - chao1984(y_hist)$Nhat/n_genes
+    chaobunge_estimated_dropout[i] = 1 - ChaoBunge(y_hist)$Nhat/n_genes
+    chaolee_estimated_dropout[i] = 1 - ChaoLee1992(y_hist, method = "ACE")$Nhat/n_genes
+    #pnpmle_estimated_dropout[i] = 1 - pnpmle(y_hist, C=0, dis = 0)$Nhat/n_genes
+    negbinom_estimated_dropout[i] = 1 - neg_binom_species(y_hist)/n_genes
+    lognorm_estimated_dropout[i] = 1 - lognorm_species(y)/n_genes
+    if(dim(y_hist)[1] == 6 & y_hist[6, 1] == 6){
+      # need sufficient number of counts for breakaway
+      breakaway_estimated_dropout[i] = 1 - breakaway(y_hist, plot = FALSE, print = FALSE, answers = TRUE)$est/n_genes
+    }
+    jackknife_estimated_dropout[i] = 1 - jackknife(y_hist)$Nhat/n_genes
+	}
+}
+```
+```{r}
+d = data.frame(d, preseq_estimated_dropout = preseq_estimated_dropout, 
+               chao_estimated_dropout = chao_estimated_dropout, 
+               chaolee_estimated_dropout = chaolee_estimated_dropout, 
+               chaobunge_estimated_dropout = chaobunge_estimated_dropout, 
+               #pnpmle_estimated_dropout = pnpmle_estimated_dropout, 
+               breakaway_estimated_dropout = breakaway_estimated_dropout, 
+               jackknife_estimated_dropout = jackknife_estimated_dropout,
+               negbinom_estimated_dropout = negbinom_estimated_dropout,
+               lognorm_estimated_dropout = lognorm_estimated_dropout,
+               depth = colSums(counts))
+
+d$preseq_estimated_dropout[which(d$preseq_estimated_dropout <= 0 | is.na(d$preseq_estimated_dropout))] = d$observed_dropout[which(d$preseq_estimated_dropout <= 0)]
+#d$pnpmle_estimated_dropout[which(d$pnpmle_estimated_dropout <= 0)] = d$observed_dropout[which(d$pnpmle_estimated_dropout <= 0)]
+d$chaobunge_estimated_dropout[which(d$chaobunge_estimated_dropout <= 0 | is.na(d$chaobunge_estimated_dropout))] = d$observed_dropout[which(d$chaobunge_estimated_dropout <= 0)]
+d$chao_estimated_dropout[which(d$chao_estimated_dropout <= 0 | is.na(d$chao_estimated_dropout))] = d$observed_dropout[which(d$chao_estimated_dropout <= 0)]
+d$chaolee_estimated_dropout[which(d$chaolee_estimated_dropout <= 0 | is.na(d$chaolee_estimated_dropout))] = d$observed_dropout[which(d$chaolee_estimated_dropout <= 0)]
+d$breakaway_estimated_dropout[which(d$breakaway_estimated_dropout <= 0 | is.na(d$breakaway_estimated_dropout))] = d$observed_dropout[which(d$breakaway_estimated_dropout <= 0)]
+d$jackknife_estimated_dropout[which(d$jackknife_estimated_dropout <= 0 | is.na(d$jackknife_estimated_dropout))] = d$observed_dropout[which(d$jackknife_estimated_dropout <= 0)]
+d$negbinom_estimated_dropout[which(d$negbinom_estimated_dropout <= 0 | is.na(d$negbinom_estimated_dropout))] = d$observed_dropout[which(d$negbinom_estimated_dropout <= 0 | is.na(d$negbinom_estimated_dropout))]
+d$lognorm_estimated_dropout[which(d$lognorm_estimated_dropout <= 0 |  is.na(d$lognorm_estimated_dropout))] = d$observed_dropout[which(d$lognorm_estimated_dropout <= 0 |  is.na(d$lognorm_estimated_dropout))]
+d$chaobunge_estimated_dropout[which(d$chaobunge_estimated_dropout > 1)] = 1
+d$chaolee_estimated_dropout[which(d$chaolee_estimated_dropout > 1)] = 1
+
+y = data.frame(algorithm = c("observed", "ACE", "breakaway", "ChaoBunge", "Chao", "jackknife", "preseq", "negbinom", "lognorm"#, "pnpmle"
+                             ), correlations = c(cor(d$depth, d$observed_dropout), 
+                                                 cor(d$depth, d$chaolee_estimated_dropout),
+                                                 cor(d$depth, d$breakaway_estimated_dropout),
+                                                 cor(d$depth, d$chaobunge_estimated_dropout),
+                                                 cor(d$depth, d$chao_estimated_dropout),
+                                                 cor(d$depth, d$jackknife_estimated_dropout),
+                                                 cor(d$depth, d$preseq_estimated_dropout),
+                                                 cor(d$depth, d$negbinom_estimated_dropout),
+                                                 cor(d$depth, d$lognorm_estimated_dropout)
+                                                 #,cor(d$depth, d$pnpmle_estimated_dropout)
+                                                 ))
+y$algorithm = factor(y$algorithm, levels = c("observed","ACE", "breakaway", "ChaoBunge", "Chao", "jackknife", "preseq", "negbinom", "lognorm"#, "pnpmle"
+                                             ))
+ggplot(y, aes(x = algorithm, y = correlations)) + geom_bar(stat="identity") + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+y
+
+c = data.frame(correlations = c(cor(d$true_dropout, d$observed_dropout), 
+                                cor(d$true_dropout, d$chaolee_estimated_dropout),
+                                cor(d$true_dropout, d$breakaway_estimated_dropout),
+                                cor(d$true_dropout, d$chaobunge_estimated_dropout),
+                                cor(d$true_dropout, d$chao_estimated_dropout), 
+                                cor(d$true_dropout, d$jackknife_estimated_dropout),
+                                cor(d$true_dropout, d$preseq_estimated_dropout), 
+                                cor(d$true_dropout, d$negbinom_estimated_dropout),
+                                cor(d$true_dropout, d$lognorm_estimated_dropout)
+                                #, cor(d$true_dropout, d$pnpmle_estimated_dropout)
+                                                                                                                                                                                                                                                                                                                                                                                           ), 
+               algorithm = c("observed", "ACE", "breakaway", "ChaoBunge", "Chao", "jackknife", "preseq", "negbinom", "lognorm"
+#, "pnpmle"
+))
+c
+
+
+meanSquareError = data.frame(meanSquareError = c(mean((d$true_dropout - d$observed_dropout)^2), 
+                                                 mean((d$true_dropout - d$chaolee_estimated_dropout)^2),
+                                                 mean((d$true_dropout - d$breakaway_estimated_dropout)^2),
+                                                 mean((d$true_dropout - d$chaobunge_estimated_dropout)^2),
+                                                 mean((d$true_dropout - d$chao_estimated_dropout)^2),
+                                                 mean((d$true_dropout - d$jackknife_estimated_dropout)^2), 
+                                                 mean((d$true_dropout - d$preseq_estimated_dropout)^2),
+                                                 mean((d$true_dropout - d$negbinom_estimated_dropout)^2),
+                                                 mean((d$true_dropout - d$lognorm_estimated_dropout)^2)),
+                             
+                             algorithm = c("observed", "ACE", "breakaway", "ChaoBunge", "Chao", "jackknife", "preseq", "negbinom", "lognorm"))
+meanSquareError$algorithm = factor(meanSquareError$algorithm, levels = c("observed", "ACE", "breakaway", "ChaoBunge", "Chao", "jackknife", "negbinom", "lognorm", "preseq"))
+meanSquareError
+
+ggplot(meanSquareError, aes(y = meanSquareError, x = algorithm)) + geom_bar(stat="identity") + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+                             
+ggplot(c, aes(x = algorithm, y = correlations)) + geom_bar(stat="identity") + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+
+ggplot(d, aes(x = observed_dropout, y = true_dropout)) + geom_point(alpha = 0.8) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + xlim(0, 1) + ylim(0, 1) + geom_abline(intercept = 0, slope = 1)
+ggplot(d, aes(x = preseq_estimated_dropout, y = true_dropout)) + geom_point(alpha = 0.8) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + xlim(0, 1) + ylim(0, 1) + geom_abline(intercept = 0, slope = 1)
+ggplot(d, aes(x = negbinom_estimated_dropout, y = true_dropout)) + geom_point(alpha = 0.8) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + xlim(0, 1) + ylim(0, 1) + geom_abline(intercept = 0, slope = 1)
+ggplot(d, aes(x = lognorm_estimated_dropout, y = true_dropout)) + geom_point(alpha = 0.8) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + xlim(0, 1) + ylim(0, 1) + geom_abline(intercept = 0, slope = 1)
+#ggplot(d, aes(x = pnpmle_estimated_dropout, y = true_dropout)) + geom_point(alpha = 0.8) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + xlim(0, 1) + ylim(0, 1) + geom_abline(intercept = 0, slope = 1)
+ggplot(d, aes(x = chaolee_estimated_dropout, y = true_dropout)) + geom_point(alpha = 0.8) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + xlim(0, 1) + ylim(0, 1) + geom_abline(intercept = 0, slope = 1)
+ggplot(d, aes(x = jackknife_estimated_dropout, y = true_dropout)) + geom_point(alpha = 0.8) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + xlim(0, 1) + ylim(0, 1) + geom_abline(intercept = 0, slope = 1)
+ggplot(d, aes(x = chao_estimated_dropout, y = true_dropout)) + geom_point(alpha = 0.8) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + xlim(0, 1) + ylim(0, 1) + geom_abline(intercept = 0, slope = 1)
+ggplot(d, aes(x = breakaway_estimated_dropout, y = true_dropout)) + geom_point(alpha = 0.8) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + xlim(0, 1) + ylim(0, 1) + geom_abline(intercept = 0, slope = 1)
+ggplot(d, aes(x = chaobunge_estimated_dropout, y = true_dropout)) + geom_point(alpha = 0.8) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + xlim(0, 1) + ylim(0, 1) + geom_abline(intercept = 0, slope = 1)
+```
+
+```{r}
+sampleWeights = (1 - preseq_estimated_dropout)
+hist(sampleWeights, breaks = 50, col = "grey")
+```
+
+```{r}
+library(edgeR)
+condition = factor(as.numeric(startsWith(sapply(cellLabels, toString), "treat")))
+design <- model.matrix(~condition)
+naiveDGE = DGEList(counts)
+naiveDGE = calcNormFactors(naiveDGE)
+naiveV = cpm(naiveDGE, log=TRUE, prior.count=3)
+naiveFit = lmFit(naiveV, design=design)
+naiveEB = eBayes(naiveFit, trend=TRUE, robust=TRUE)
+decideTests(naiveEB)
+naiveEB.results = topTable(naiveEB, number = dim(counts)[1])
+dim(naiveEB.results)
+head(naiveEB.results)
+length(geneConditions)
+
+sum(geneConditions > 0)
+sum(naiveEB.results$logFC > 0)
+sum(naiveEB.results$adj.P.Val < 0.05)
+sum(geneConditions > 0 & naiveEB.results$logFC > 0 & naiveEB.results$adj.P.Val < 0.05)
+sum(geneConditions > 0 & naiveEB.results$logFC > 0 & naiveEB.results$adj.P.Val < 0.05)/sum(geneConditions > 0)
+
+sum(geneConditions < 0)
+sum(naiveEB.results$logFC < 0)
+sum(naiveEB.results$adj.P.Val < 0.05)
+sum(geneConditions < 0 & naiveEB.results$logFC < 0 & naiveEB.results$adj.P.Val < 0.05)
+sum(geneConditions < 0 & naiveEB.results$logFC < 0 & naiveEB.results$adj.P.Val < 0.05)/sum(geneConditions > 0)
+```
+
+```{r}
+# corrected by dropout rate
+condition = factor(as.numeric(startsWith(sapply(cellLabels, toString), "treat")))
+design <- model.matrix(~condition)
+correctedDGE = DGEList(counts)
+correctedDGE = calcNormFactors(correctedDGE)
+correctedV = cpm(correctedDGE, log=TRUE, prior.count=3)
+correctedFit = lmFit(correctedV, design=design, weights = 1 - preseq_estimated_dropout)
+correctedEB = eBayes(correctedFit, trend=TRUE, robust=TRUE)
+decideTests(correctedEB)
+correctedEB.results = topTable(correctedEB, number = dim(counts)[1])
+dim(correctedEB.results)
+head(correctedEB.results)
+length(geneConditions)
+
+sum(geneConditions > 0)
+sum(correctedEB.results$logFC > 0)
+sum(correctedEB.results$adj.P.Val < 0.05)
+sum(geneConditions > 0 & correctedEB.results$logFC > 0 & correctedEB.results$adj.P.Val < 0.05)
+sum(geneConditions > 0 & correctedEB.results$logFC > 0 & correctedEB.results$adj.P.Val < 0.05)/sum(geneConditions > 0)
+
+sum(geneConditions < 0)
+sum(correctedEB.results$logFC < 0)
+sum(correctedEB.results$adj.P.Val < 0.05)
+sum(geneConditions < 0 & correctedEB.results$logFC < 0 & correctedEB.results$adj.P.Val < 0.05)
+sum(geneConditions < 0 & correctedEB.results$logFC < 0 & correctedEB.results$adj.P.Val < 0.05)/sum(geneConditions > 0)
+```
+
+```{r}
+# corrected by dropout rate
+condition = factor(as.numeric(startsWith(sapply(cellLabels, toString), "treat")))
+design <- model.matrix(~condition)
+AWcorrectedDGE = DGEList(counts)
+AWcorrectedDGE = calcNormFactors(AWcorrectedDGE)
+AWcorrectedV = cpm(AWcorrectedDGE, log=TRUE, prior.count=3)
+aw = arrayWeights(AWcorrectedV, design)
+AWcorrectedFit = lmFit(AWcorrectedV, design=design, weights = aw)
+AWcorrectedEB = eBayes(AWcorrectedFit, trend=TRUE, robust=TRUE)
+decideTests(AWcorrectedEB)
+AWcorrectedEB.results = topTable(AWcorrectedEB, number = dim(counts)[1])
+dim(AWcorrectedEB.results)
+head(AWcorrectedEB.results)
+length(geneConditions)
+
+sum(geneConditions > 0)
+sum(AWcorrectedEB.results$logFC > 0)
+sum(AWcorrectedEB.results$adj.P.Val < 0.05)
+sum(geneConditions > 0 & AWcorrectedEB.results$logFC > 0 & AWcorrectedEB.results$adj.P.Val < 0.05)
+sum(geneConditions > 0 & AWcorrectedEB.results$logFC > 0 & AWcorrectedEB.results$adj.P.Val < 0.05)/sum(geneConditions > 0)
+
+sum(geneConditions < 0)
+sum(AWcorrectedEB.results$logFC < 0)
+sum(AWcorrectedEB.results$adj.P.Val < 0.05)
+sum(geneConditions < 0 & AWcorrectedEB.results$logFC < 0 & AWcorrectedEB.results$adj.P.Val < 0.05)
+sum(geneConditions < 0 & AWcorrectedEB.results$logFC < 0 & AWcorrectedEB.results$adj.P.Val < 0.05)/sum(geneConditions > 0)
+```
+
+```{r}
+library(pander)
+x = data.frame(p0.01 = c(sum(geneConditions != 0), 
+                         sum(sign(geneConditions) == sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.01), 
+                         sum(sign(geneConditions) == sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.01),  
+                         sum(sign(geneConditions) == sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.01)), 
+               p0.05 = c(sum(geneConditions != 0), sum(sign(geneConditions) == sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.05),
+                         sum(sign(geneConditions) == sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.05),  
+                         sum(sign(geneConditions) == sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.05)),
+               p0.1 = c(sum(geneConditions != 0), 
+                        sum(sign(geneConditions) == sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.1), 
+                        sum(sign(geneConditions) == sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.1),  
+                        sum(sign(geneConditions) == sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.1)))
+rownames(x) = c("total", "naive", "preseq corrected", "AW corrected")
+pander::pander(x)
+
+x = data.frame(p0.01 = c(sum(sign(geneConditions) != sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.01), 
+                         sum(sign(geneConditions) != sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.01),  
+                         sum(sign(geneConditions) != sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.01)), 
+               p0.05 = c(sum(sign(geneConditions) != sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.05),
+                         sum(sign(geneConditions) != sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.05),  
+                         sum(sign(geneConditions) != sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.05)),
+               p0.1 = c(sum(sign(geneConditions) != sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.1), 
+                        sum(sign(geneConditions) != sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.1),  
+                        sum(sign(geneConditions) != sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.1)))
+rownames(x) = c("naive", "preseq corrected", "AW corrected")
+pander::pander(x)
+
+ggplot(data.frame(arrayWeights = aw, preseqWeights = 1 - preseq_estimated_dropout), aes(x = arrayWeights, y = preseqWeights)) + geom_point() + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+cor(aw, 1 - preseq_estimated_dropout)
+```
+
+```{r}
+# observation weights with edgeR
+# from https://github.com/statOmics/zinbwaveZinger/blob/master/timebenchmark/islam/benchmark_islam.Rmd
+library(zinbwave)
+library(edgeR)
+# compute zinbwave weights
+zinb = zinbwave::zinbFit(Y = counts, X = design, epsilon = 1e12)
+weights = zinbwave::computeObservationalWeights(zinb, counts)
+d = edgeR::DGEList(counts)
+d = edgeR::calcNormFactors(d)
+d$weights = weights
+d = edgeR::estimateDisp(d, design)
+fit = edgeR::glmFit(d,design)
+lrt = zinbwave::glmWeightedF(fit,coef=2, independentFiltering = TRUE)
+pvals = lrt$table$padjFilter
+#pvals = p.adjust(pvals, method = "BH")
+
+sum(geneConditions > 0)
+sum(lrt$table$logFC > 0)
+sum(pvals < 0.05)
+sum(geneConditions > 0 & lrt$table$logFC > 0 & pvals < 0.05)
+sum(geneConditions > 0 & lrt$table$logFC > 0 & pvals < 0.05)/sum(geneConditions > 0)
+
+sum(geneConditions > 0)
+sum(lrt$table$logFC < 0)
+sum(pvals < 0.05)
+sum(geneConditions > 0 & lrt$table$logFC < 0 & pvals < 0.05)
+sum(geneConditions > 0 & lrt$table$logFC < 0 & pvals < 0.05)/sum(geneConditions > 0)
+
+# true positives
+x = data.frame(p0.01 = c(sum(sign(geneConditions) == sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.01), 
+                         sum(sign(geneConditions) == sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.01),  
+                         sum(sign(geneConditions) == sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.01),
+                         sum(sign(geneConditions) == sign(lrt$table$logFC) & pvals < 0.01)), 
+               p0.05 = c(sum(sign(geneConditions) == sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.05),
+                         sum(sign(geneConditions) == sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.05),  
+                         sum(sign(geneConditions) == sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.05),
+                         sum(sign(geneConditions) == sign(lrt$table$logFC) & pvals < 0.05)),
+               p0.1 = c(sum(sign(geneConditions) == sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.1), 
+                        sum(sign(geneConditions) == sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.1),  
+                        sum(sign(geneConditions) == sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.1),
+                        sum(sign(geneConditions) == sign(lrt$table$logFC) & pvals < 0.1)))
+rownames(x) = c("naive", "preseq corrected", "AW corrected", "observation weights")
+pander::pander(x)
+
+s = exp(seq(from = -8, to = -1, length = 101))
+x = data.frame(algorithm = rep(c("naive", "preseq corrected", "AW corrected","observation weights"), each = length(s)), TruePositives = c(sapply(s, function(p) sum(sign(geneConditions) == sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < p)), sapply(s, function(p) sum(sign(geneConditions) == sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < p)), sapply(s, function(p) sum(sign(geneConditions) == sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < p)), sapply(s, function(p) sum(sign(geneConditions) == sign(lrt$table$logFC) & pvals < p)) ), FDRthresh = rep(s, times = 4))
+ggplot(x, aes(x = FDRthresh, y = TruePositives, col = algorithm)) + geom_line() + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + ggtitle("True positives vs adjust p-value threshold")
+
+x = data.frame(algorithm = rep(c("naive", "preseq corrected", "AW corrected","observation weights"), each = length(s)), FalsePositives = c(sapply(s, function(p) sum(sign(geneConditions) != sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < p)), sapply(s, function(p) sum(sign(geneConditions) != sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < p)), sapply(s, function(p) sum(sign(geneConditions) != sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < p)), sapply(s, function(p) sum(sign(geneConditions) != sign(lrt$table$logFC) & pvals < p)) ), FDRthresh = rep(s, times = 4))
+ggplot(x, aes(x = FDRthresh, y = FalsePositives, col = algorithm)) + geom_line() + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + ggtitle("False positives vs adjust p-value threshold")
+
+
+#False positives
+x = data.frame(p0.01 = c(sum(sign(geneConditions) != sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.01), 
+                         sum(sign(geneConditions) != sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.01),  
+                         sum(sign(geneConditions) != sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.01),
+                         sum(sign(geneConditions) != sign(lrt$table$logFC) & pvals < 0.01)), 
+               p0.05 = c(sum(sign(geneConditions) != sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.05),
+                         sum(sign(geneConditions) != sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.05),  
+                         sum(sign(geneConditions) != sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.05),
+                         sum(sign(geneConditions) != sign(lrt$table$logFC) & pvals < 0.05)),
+               p0.1 = c(sum(sign(geneConditions) != sign(naiveEB.results$logFC) & naiveEB.results$adj.P.Val < 0.1), 
+                        sum(sign(geneConditions) != sign(correctedEB.results$logFC) & correctedEB.results$adj.P.Val < 0.1),  
+                        sum(sign(geneConditions) != sign(AWcorrectedEB.results$logFC) & AWcorrectedEB.results$adj.P.Val < 0.1),
+                        sum(sign(geneConditions) == sign(lrt$table$logFC) & pvals < 0.1)))
+rownames(x) = c("naive", "preseq corrected", "AW corrected", "observation weights")
+pander::pander(x)
+```
